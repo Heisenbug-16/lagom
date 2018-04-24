@@ -27,10 +27,11 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.persistence.EntityManager;
 import javax.persistence.Query;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.Timer;
+import java.util.TimerTask;
 
 import static scala.collection.JavaConversions.asJavaIterable;
 
@@ -86,83 +87,96 @@ public class JpaReadSideImpl implements JpaReadSide {
         private final BiConsumer<EntityManager, AggregateEventTag<Event>> prepare;
         private final PMap<Class<? extends Event>, BiConsumer<EntityManager, ? extends Event>> eventHandlers;
 
-        private volatile AggregateEventTag<Event> tag;
-        private volatile SlickOffsetDao offsetDao;
+		private volatile AggregateEventTag<Event> tag;
+		private volatile SlickOffsetDao offsetDao;
+		private BatchedOffsetUpdater batchUpdateOffsetUpdater;
 
-        private JpaReadSideHandler(
-                String readSideId,
-                Consumer<EntityManager> globalPrepare,
-                BiConsumer<EntityManager, AggregateEventTag<Event>> prepare,
-                PMap<Class<? extends Event>, BiConsumer<EntityManager, ? extends Event>> eventHandlers) {
-            this.readSideId = readSideId;
-            this.globalPrepare = globalPrepare;
-            this.prepare = prepare;
-            this.eventHandlers = eventHandlers;
-        }
+		private JpaReadSideHandler(String readSideId, Consumer<EntityManager> globalPrepare,
+				BiConsumer<EntityManager, AggregateEventTag<Event>> prepare,
+				PMap<Class<? extends Event>, BiConsumer<EntityManager, ? extends Event>> eventHandlers) {
+			this.readSideId = readSideId;
+			this.globalPrepare = globalPrepare;
+			this.prepare = prepare;
+			this.eventHandlers = eventHandlers;
+			batchUpdateOffsetUpdater = new BatchedOffsetUpdater();
+		}
 
-        @Override
-        public CompletionStage<Done> globalPrepare() {
-            return jpa.withTransaction(entityManager -> {
-                log.debug("Starting globalPrepare in JpaReadSideHandler: {}", readSideId);
-                globalPrepare.accept(entityManager);
-                log.debug("Completed globalPrepare in JpaReadSideHandler: {}", readSideId);
-                return Done.getInstance();
-            });
-        }
+		@Override
+		public CompletionStage<Done> globalPrepare() {
+			return jpa.withTransaction(entityManager -> {
+				log.debug("Starting globalPrepare in JpaReadSideHandler: {}", readSideId);
+				globalPrepare.accept(entityManager);
+				log.debug("Completed globalPrepare in JpaReadSideHandler: {}", readSideId);
+				return Done.getInstance();
+			});
+		}
 
-        @Override
-        public CompletionStage<Offset> prepare(AggregateEventTag<Event> tag) {
-            this.tag = tag;
-            return jpa.withTransaction(entityManager -> {
-                log.debug("Starting prepare tag {} in JpaReadSideHandler: {}", tag, readSideId);
-                prepare.accept(entityManager, tag);
-                log.debug("Completed prepare tag {} in JpaReadSideHandler: {}", tag, readSideId);
-                return Done.getInstance();
-            }).thenCombine(prepareOffsetDao(tag), (done, offset) -> {
+		@Override
+		public CompletionStage<Offset> prepare(AggregateEventTag<Event> tag) {
+			this.tag = tag;
+			return jpa.withTransaction(entityManager -> {
+				log.debug("Starting prepare tag {} in JpaReadSideHandler: {}", tag, readSideId);
+				prepare.accept(entityManager, tag);
+				log.debug("Completed prepare tag {} in JpaReadSideHandler: {}", tag, readSideId);
+				return Done.getInstance();
+			}).thenCombine(prepareOffsetDao(tag), (done, offset) -> {
                 log.debug("Starting events for tag {} from offset {} in JpaReadSideHandler: {}",
                         tag, offset, readSideId);
-                return offset;
-            });
-        }
+				return offset;
+			});
+		}
 
-        @Override
-        public Flow<Pair<Event, Offset>, Done, ?> handle() {
-            return Flow.<Pair<Event, Offset>>create().mapAsync(1, eventAndOffset -> {
-                Event event = eventAndOffset.first();
-                Offset offset = eventAndOffset.second();
+		@Override
+		public Flow<Pair<Event, Offset>, Done, ?> handle() {
+			//This parameter shall be taken from configuration and will be global to this class (Not local to this method)
+			boolean isBatchUpdateEnabled = true;
+			return Flow.<Pair<Event, Offset>>create().mapAsync(1, eventAndOffset -> {
+				Event event = eventAndOffset.first();
+				Offset offset = eventAndOffset.second();
                 @SuppressWarnings("unchecked") Class<Event> eventClass = (Class<Event>) event.getClass();
                 @SuppressWarnings("unchecked") BiConsumer<EntityManager, Event> eventHandler =
                         (BiConsumer<EntityManager, Event>) eventHandlers.get(eventClass);
 
-                return jpa.withTransaction(entityManager -> {
-                    if (log.isDebugEnabled())
-                        log.debug("Starting handler for event {} at offset {} in JpaReadSideHandler: {}",
-                            eventClass.getName(), offset, readSideId);
-                    if (eventHandler != null) {
-                        eventHandler.accept(entityManager, event);
-                    } else {
-                        if (log.isDebugEnabled())
+				CompletionStage<Done> result = jpa.withTransaction(entityManager -> {
+					if (log.isDebugEnabled())
+						log.debug("Starting handler for event {} at offset {} in JpaReadSideHandler: {}",
+								eventClass.getName(), offset, readSideId);
+					if (eventHandler != null) {
+						eventHandler.accept(entityManager, event);
+					} else {
+						if (log.isDebugEnabled())
                             log.debug("Unhandled event {} at offset {} in JpaReadSideHandler: {}",
                                 eventClass.getName(), offset, readSideId);
-                    }
-                    updateOffset(entityManager, offset);
-                    if (log.isDebugEnabled())
-                        log.debug("Completed handler for event {} at offset {} in JpaReadSideHandler: {}",
-                            eventClass.getName(), offset, readSideId);
-                    return Done.getInstance();
-                });
-            });
-        }
+					}
+					if(!isBatchUpdateEnabled){
+						updateOffset(entityManager, offset);
+					}
+					if (log.isDebugEnabled())
+						log.debug("Completed handler for event {} at offset {} in JpaReadSideHandler: {}",
+								eventClass.getName(), offset, readSideId);
+					return Done.getInstance();
+				});
+				
+				if(isBatchUpdateEnabled){
+					CompletionStage<Done> offsetUpdateResult = result.thenApply( r -> {
+						batchUpdateOffsetUpdater.checkAndUpdateOffset(offset);
+						return Done.getInstance();
+					});
+					return offsetUpdateResult;
+				}
+				return result;
+			});
+		}
 
-        private CompletionStage<Offset> prepareOffsetDao(AggregateEventTag<Event> tag) {
+		private CompletionStage<Offset> prepareOffsetDao(AggregateEventTag<Event> tag) {
             return FutureConverters.toJava(offsetStore.prepare(readSideId, tag.tag()))
                     .thenApply(offsetDao -> {
-                        this.offsetDao = offsetDao;
-                        return OffsetAdapter.offsetToDslOffset(offsetDao.loadedOffset());
-                    });
-        }
+				this.offsetDao = offsetDao;
+				return OffsetAdapter.offsetToDslOffset(offsetDao.loadedOffset());
+			});
+		}
 
-        private void updateOffset(EntityManager entityManager, Offset offset) {
+		private void updateOffset(EntityManager entityManager, Offset offset) {
             Long sequenceOffset = offset instanceof Offset.Sequence ?
                     ((Offset.Sequence) offset).value() : null;
             String timeUuidOffset = offset instanceof Offset.TimeBasedUUID ?
@@ -170,40 +184,40 @@ public class JpaReadSideImpl implements JpaReadSide {
             Iterable<String> sqlStatements =
                     asJavaIterable(offsetDao.updateOffsetQuery(OffsetAdapter.dslOffsetToOffset(offset)).statements());
 
-            for (String statement : sqlStatements) {
+			for (String statement : sqlStatements) {
                 log.debug("Updating offset to {} in JpaReadsideHandler {} with statement: {}",
                         offset, readSideId, statement);
-                Query updateOffsetQuery = entityManager.createNativeQuery(statement);
+				Query updateOffsetQuery = entityManager.createNativeQuery(statement);
                 // NOTE: The order of parameters here depends on the order chosen
-                // by Slick, based on the table definition in JdbcOffsetStore
-                // and the specific database profile in use.
-                JdbcProfile profile = getSlickDatabaseProfile();
-                if (profile instanceof PostgresProfile) {
-                    postgresqlBindUpdateOffsetQuery(updateOffsetQuery, sequenceOffset, timeUuidOffset);
-                } else {
-                    defaultBindUpdateOffsetQuery(updateOffsetQuery, sequenceOffset, timeUuidOffset);
-                }
-                updateOffsetQuery.executeUpdate();
-            }
-        }
+				// by Slick, based on the table definition in JdbcOffsetStore
+				// and the specific database profile in use.
+				JdbcProfile profile = getSlickDatabaseProfile();
+				if (profile instanceof PostgresProfile) {
+					postgresqlBindUpdateOffsetQuery(updateOffsetQuery, sequenceOffset, timeUuidOffset);
+				} else {
+					defaultBindUpdateOffsetQuery(updateOffsetQuery, sequenceOffset, timeUuidOffset);
+				}
+				updateOffsetQuery.executeUpdate();
+			}
+		}
 
-        private JdbcProfile getSlickDatabaseProfile() {
-            return offsetStore.slick().profile();
-        }
+		private JdbcProfile getSlickDatabaseProfile() {
+			return offsetStore.slick().profile();
+		}
 
-        private Query postgresqlBindUpdateOffsetQuery(Query query, Long sequenceOffset, String timeUuidOffset) {
+		private Query postgresqlBindUpdateOffsetQuery(Query query, Long sequenceOffset, String timeUuidOffset) {
             // Slick emulates insert or update on PostgreSQL using this compound statement:
-            // begin;
-            //   update "read_side_offsets"
-            //     set "sequence_offset"=?,"time_uuid_offset"=?
-            //     where "read_side_id"=?
-            //     and "tag"=?;
+			// begin;
+			// update "read_side_offsets"
+			// set "sequence_offset"=?,"time_uuid_offset"=?
+			// where "read_side_id"=?
+			// and "tag"=?;
             //   insert into "read_side_offsets" ("read_side_id","tag","sequence_offset","time_uuid_offset")
-            //     select ?,?,?,?
-            //     where not exists (
+			// select ?,?,?,?
+			// where not exists (
             //       select 1 from "read_side_offsets" where "read_side_id"=? and "tag"=?
-            //     );
-            // end
+			// );
+			// end
             return query
                     .setParameter(1, sequenceOffset)
                     .setParameter(2, timeUuidOffset)
@@ -214,18 +228,65 @@ public class JpaReadSideImpl implements JpaReadSide {
                     .setParameter(7, sequenceOffset)
                     .setParameter(8, timeUuidOffset)
                     .setParameter(9, readSideId)
-                    .setParameter(10, tag.tag());
-        }
+					.setParameter(10, tag.tag());
+		}
 
-        private Query defaultBindUpdateOffsetQuery(Query query, Long sequenceOffset, String timeUuidOffset) {
-            // H2:
+		private Query defaultBindUpdateOffsetQuery(Query query, Long sequenceOffset, String timeUuidOffset) {
+			// H2:
             // merge into "read_side_offsets" ("read_side_id","tag","sequence_offset","time_uuid_offset")
-            //   values (?,?,?,?)
+			// values (?,?,?,?)
             return query
                     .setParameter(1, readSideId)
                     .setParameter(2, tag.tag())
                     .setParameter(3, sequenceOffset)
-                    .setParameter(4, timeUuidOffset);
-        }
-    }
+					.setParameter(4, timeUuidOffset);
+		}
+
+		private class BatchedOffsetUpdater {
+
+			private Long updateOffsetRequestCount = 0l;
+			private Long lastupdatedOffsetRequestCount = 0l;
+			private Offset offsetToBeUpdated = null;
+			private Object lock = new Object();
+
+			private Timer offsetUpdaterTimer = new Timer("offset-update-timer", true);
+
+			BatchedOffsetUpdater() {
+				offsetUpdaterTimer.schedule(new UpdateOffsetTask(), 5 * 1000);
+			}
+
+			public void checkAndUpdateOffset(Offset offset) {
+				synchronized (lock) {
+					updateOffsetRequestCount++;
+					if (updateOffsetRequestCount - lastupdatedOffsetRequestCount > 6) {
+						batchUpdateOffset(offset);
+					} else {
+						offsetToBeUpdated = offset;
+					}
+				}
+			}
+
+			private void batchUpdateOffset(Offset offset) {
+				jpa.withTransaction(entityManager -> {
+					updateOffset(entityManager, offset);
+					offsetToBeUpdated = null;
+					lastupdatedOffsetRequestCount = updateOffsetRequestCount;
+					return Done.getInstance();
+				});
+			}
+
+			class UpdateOffsetTask extends TimerTask {
+
+				public void run() {
+					synchronized (lock) {
+						if (offsetToBeUpdated != null) {
+							batchUpdateOffset(offsetToBeUpdated);
+						}
+						offsetUpdaterTimer.schedule(new UpdateOffsetTask(), 5 * 1000);
+					}
+				}
+			}
+		}
+	}
 }
+
